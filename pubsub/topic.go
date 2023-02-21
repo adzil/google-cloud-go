@@ -34,7 +34,6 @@ import (
 	"go.opencensus.io/stats"
 	"go.opencensus.io/tag"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/api/support/bundler"
 	fmpb "google.golang.org/genproto/protobuf/field_mask"
@@ -574,8 +573,7 @@ func (t *Topic) Publish(ctx context.Context, msg *Message) *PublishResult {
 		ipubsub.SetPublishResult(r, "", err)
 		return r
 	}
-	link := trace.LinkFromContext(ctx, attribute.String("ordering_key", msg.OrderingKey))
-	err = t.scheduler.Add(msg.OrderingKey, &bundledMessage{msg, r, msgSize, link}, msgSize)
+	err = t.scheduler.Add(msg.OrderingKey, &bundledMessage{msg, r, msgSize, ctx}, msgSize)
 	if err != nil {
 		t.scheduler.Pause(msg.OrderingKey)
 		ipubsub.SetPublishResult(r, "", err)
@@ -609,7 +607,7 @@ type bundledMessage struct {
 	msg  *Message
 	res  *PublishResult
 	size int
-	link trace.Link
+	ctx  context.Context
 }
 
 func (t *Topic) initBundler() {
@@ -691,7 +689,7 @@ func (t *Topic) publishMessageBundle(ctx context.Context, bms []*bundledMessage)
 	}
 
 	pbMsgs := make([]*pb.PubsubMessage, len(bms))
-	links := make([]trace.Link, len(bms))
+	spans := make([]trace.Span, len(bms))
 	var orderingKey string
 	for i, bm := range bms {
 		orderingKey = bm.msg.OrderingKey
@@ -700,12 +698,15 @@ func (t *Topic) publishMessageBundle(ctx context.Context, bms []*bundledMessage)
 			Attributes:  bm.msg.Attributes,
 			OrderingKey: bm.msg.OrderingKey,
 		}
-		links[i] = bm.link
+		_, spans[i] = tracer.Start(bm.ctx, "pubsub.Topic.publishMessageBundle")
 		bm.msg = nil // release bm.msg for GC
 	}
 
-	ctx, span := tracer.Start(ctx, "pubsub.Topic.publishMessageBundle", trace.WithLinks(links...))
-	defer span.End()
+	defer func() {
+		for _, span := range spans {
+			span.End()
+		}
+	}()
 
 	var res *pb.PublishResponse
 	start := time.Now()
